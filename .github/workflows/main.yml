@@ -24,15 +24,19 @@ jobs:
 
       - name: 🚀 Start LocalXpose Tunnel (RDP)
         run: |
-          Start-Job -Name loclxJob -ScriptBlock {
-            loclx tunnel tcp --to 3389
-          }
+          # شغل التونيل كـ foreground
+          Start-Process -FilePath "loclx" -ArgumentList "tunnel tcp --to 3389" -NoNewWindow -RedirectStandardOutput loclx.log -RedirectStandardError loclx.log
+          
+          # استنى شوية لحد ما التونيل يفتح
           Start-Sleep -Seconds 20
-          $publicUrl = loclx list tunnels | Select-String -Pattern "tcp://"
+          
+          # اقرا اللوج واطلع اللينك
+          $publicUrl = Get-Content loclx.log | Select-String -Pattern "tcp://"
           if (-not $publicUrl) {
             Write-Error "❌ Failed to obtain LocalXpose public address."
             exit 1
           }
+
           Write-Output "✅ RDP available at: $publicUrl"
           Write-Output "🧑 Username: runneradmin"
           Write-Output "🔑 Password: $env:USER_PASS"
