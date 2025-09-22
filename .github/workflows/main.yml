@@ -1,4 +1,4 @@
-name: RDP - LocalXpose (loclx) TCP tunnel
+name: RDP LocalXpose (loclx) TCP tunnel
 
 on:
   workflow_dispatch:
