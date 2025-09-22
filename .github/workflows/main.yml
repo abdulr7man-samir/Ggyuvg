@@ -1,27 +1,45 @@
-- name: 🔑 Login to LocalXpose
-  run: |
-    loclx account login --access-token $env:LOC_TOKEN
-  env:
-    LOC_TOKEN: ${{ secrets.LOC_TOKEN }}
+name: 💻 RDP with LocalXpose
 
-- name: 🚀 Start LocalXpose Tunnel (RDP)
-  run: |
-    # شغل التونيل كـ foreground
-    Start-Process -FilePath "loclx" -ArgumentList "tunnel tcp --to 3389" `
-      -NoNewWindow -RedirectStandardOutput "C:\loclx_out.log" -RedirectStandardError "C:\loclx_err.log"
+on:
+  workflow_dispatch:
 
-    # استنى شوية لحد ما التونيل يفتح
-    Start-Sleep -Seconds 20
+jobs:
+  build:
+    runs-on: windows-latest
 
-    # اقرا اللوج واطلع اللينك
-    $publicUrl = Get-Content C:\loclx_out.log | Select-String -Pattern "tcp://"
-    if (-not $publicUrl) {
-      Write-Error "❌ Failed to obtain LocalXpose public address."
-      exit 1
-    }
+    steps:
+    - name: 🛠️ Install LocalXpose
+      run: choco install localxpose -y
 
-    Write-Output "✅ RDP available at: $publicUrl"
-    Write-Output "🧑 Username: runneradmin"
-    Write-Output "🔑 Password: $env:USER_PASS"
-  env:
-    USER_PASS: ${{ secrets.USER_PASS }}
+    - name: 🔑 Login to LocalXpose
+      run: |
+        loclx account login --access-token $env:LOC_TOKEN
+      env:
+        LOC_TOKEN: ${{ secrets.LOC_TOKEN }}
+
+    - name: 🚀 Start LocalXpose Tunnel (RDP)
+      run: |
+        Start-Process -FilePath "loclx" -ArgumentList "tunnel tcp --to 3389" `
+          -NoNewWindow -RedirectStandardOutput "C:\loclx_out.log" -RedirectStandardError "C:\loclx_err.log"
+
+        Start-Sleep -Seconds 20
+
+        $publicUrl = Get-Content C:\loclx_out.log | Select-String -Pattern "tcp://"
+        if (-not $publicUrl) {
+          Write-Error "❌ Failed to obtain LocalXpose public address."
+          Get-Content C:\loclx_err.log
+          exit 1
+        }
+
+        Write-Output "✅ RDP available at: $($publicUrl.Matches.Value)"
+        Write-Output "🧑 Username: runneradmin"
+        Write-Output "🔑 Password: $env:USER_PASS"
+      env:
+        USER_PASS: ${{ secrets.USER_PASS }}
+
+    - name: 💤 Keep session alive
+      run: |
+        Write-Output "⏳ Keeping RDP session alive..."
+        while ($true) {
+          Start-Sleep -Seconds 300
+        }
