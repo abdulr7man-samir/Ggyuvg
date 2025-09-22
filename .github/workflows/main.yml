@@ -1,4 +1,4 @@
-name: RDP with LocalXpose (stable, ACCESS_TOKEN)
+name: RDP with LocalXpose (fixed regex)
 
 on:
   workflow_dispatch:
@@ -16,7 +16,7 @@ jobs:
           LOC_TOKEN: ${{ secrets.LOC_TOKEN }}
         run: |
           if (-not $env:RDP_PASSWORD) { Write-Error "Add secret RDP_PASSWORD"; exit 1 }
-          if (-not $env:LOC_TOKEN)     { Write-Error "Add secret LOC_TOKEN (LocalXpose access token)"; exit 1 }
+          if (-not $env:LOC_TOKEN)     { Write-Error "Add secret LOC_TOKEN (LocalXpose token)"; exit 1 }
           Write-Host "Secrets present."
 
       - name: Enable RDP & create user
@@ -43,7 +43,6 @@ jobs:
       - name: Install Chocolatey (if missing) and LocalXpose
         shell: pwsh
         run: |
-          # install choco if missing (safe: will skip if exists)
           if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
             Write-Host "Installing Chocolatey..."
             Set-ExecutionPolicy Bypass -Scope Process -Force
@@ -52,7 +51,6 @@ jobs:
           } else {
             Write-Host "Chocolatey present."
           }
-          # install localxpose via choco (idempotent)
           choco install localxpose -y --no-progress
 
       - name: Prepare logs & set ACCESS_TOKEN env for loclx
@@ -63,9 +61,8 @@ jobs:
           New-Item -ItemType Directory -Path C:\loclx -Force | Out-Null
           Remove-Item -Path C:\loclx\loclx_out.log -ErrorAction SilentlyContinue
           Remove-Item -Path C:\loclx\loclx_err.log -ErrorAction SilentlyContinue
-          # set ACCESS_TOKEN for loclx (the CLI reads ACCESS_TOKEN env var)
-          $env:ACCESS_TOKEN = $env:LOC_TOKEN
-          Write-Host "ACCESS_TOKEN environment variable set for this step."
+          # set ACCESS_TOKEN for steps that spawn loclx
+          Write-Host "ACCESS_TOKEN will be used by the loclx process (passed via process env)."
 
       - name: Start LocalXpose tunnel (foreground with logs) and extract host:port
         shell: pwsh
@@ -73,71 +70,66 @@ jobs:
           ACCESS_TOKEN: ${{ secrets.LOC_TOKEN }}
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          $loclxPath = (Get-Command loclx -ErrorAction SilentlyContinue).Source
-          if (-not $loclxPath) {
-            # try exe path from choco default location
+          # find loclx binary
+          $loclxCmd = (Get-Command loclx -ErrorAction SilentlyContinue).Source
+          if (-not $loclxCmd) {
             $possible = "C:\ProgramData\chocolatey\bin\loclx.exe"
-            if (Test-Path $possible) { $loclxPath = $possible }
+            if (Test-Path $possible) { $loclxCmd = $possible }
           }
-          if (-not $loclxPath) {
-            Write-Error "loclx binary not found on PATH and not at expected choco path."
+          if (-not $loclxCmd) {
+            Write-Error "loclx not found on PATH and not at expected choco path."
             exit 1
           }
-          Write-Host "Using loclx at: $loclxPath"
+          Write-Host "Using loclx at: $loclxCmd"
 
           $outLog = "C:\loclx\loclx_out.log"
           $errLog = "C:\loclx\loclx_err.log"
-          # start loclx tunnel as a process and redirect output to separate files
+          if (Test-Path $outLog) { Remove-Item $outLog -Force }
+          if (Test-Path $errLog) { Remove-Item $errLog -Force }
+
+          # start process with ACCESS_TOKEN in its environment
           $si = New-Object System.Diagnostics.ProcessStartInfo
-          $si.FileName = $loclxPath
+          $si.FileName = $loclxCmd
           $si.Arguments = "tunnel tcp --to localhost:3389"
           $si.RedirectStandardOutput = $true
-          $si.RedirectStandardError = $true
+          $si.RedirectStandardError  = $true
           $si.UseShellExecute = $false
           $si.CreateNoWindow = $true
-          # IMPORTANT: ensure ACCESS_TOKEN environment variable is passed to process
           $si.EnvironmentVariables["ACCESS_TOKEN"] = $env:ACCESS_TOKEN
 
           $proc = New-Object System.Diagnostics.Process
           $proc.StartInfo = $si
-          $stdout = New-Object System.IO.StreamWriter($outLog, $false, [System.Text.Encoding]::UTF8)
-          $stderr = New-Object System.IO.StreamWriter($errLog, $false, [System.Text.Encoding]::UTF8)
           $proc.Start() | Out-Null
 
-          # async read stdout/stderr and write to files
-          $stdOutReader = $proc.StandardOutput
-          $stdErrReader = $proc.StandardError
-          Start-Job -Name loclxStreamJob -ScriptBlock {
-            param($outPath,$errPath)
-            while ($true) {
-              try {
-                if ($stdOutReader.Peek() -ge 0) {
-                  $line = $stdOutReader.ReadLine()
-                  if ($line -ne $null) { Add-Content -Path $outPath -Value $line }
-                }
-                if ($stdErrReader.Peek() -ge 0) {
-                  $eline = $stdErrReader.ReadLine()
-                  if ($eline -ne $null) { Add-Content -Path $errPath -Value $eline }
-                }
-                Start-Sleep -Milliseconds 200
-                if ($proc.HasExited) { break }
-              } catch { Start-Sleep -Milliseconds 200 }
-            }
-          } -ArgumentList $outLog,$errLog | Out-Null
-
-          # wait until the tunnel prints a tcp host:port (or timeout)
+          # stream stdout/stderr into files until process exits or until we found host
+          $found = $false
           $public = $null
+          $readerOut = $proc.StandardOutput
+          $readerErr = $proc.StandardError
+
           $maxSeconds = 180
           $elapsed = 0
-          while (-not $public -and $elapsed -lt $maxSeconds) {
-            Start-Sleep -Seconds 3
-            $elapsed += 3
-            if (Test-Path $outLog) {
-              $txt = Get-Content $outLog -Raw -ErrorAction SilentlyContinue
-              if ($txt -match "([a-z0-9\-\_]+\.loclx\.io[:]\d{2,6})") { $public = $matches[1]; break }
-              if ($txt -match "tcp://([^\s]+:\d{2,6})") { $public = $matches[1]; break }
-              if ($txt -match "Forwarding.*?([a-z0-9\-\_]+\.loclx\.io[:]\d{2,6})") { $public = $matches[1]; break }
-            }
+          while (-not $found -and $elapsed -lt $maxSeconds) {
+            Start-Sleep -Seconds 2
+            $elapsed += 2
+            try {
+              while ($readerOut.Peek() -ge 0) {
+                $line = $readerOut.ReadLine()
+                if ($line -ne $null) { Add-Content -Path $outLog -Value $line }
+                # try match patterns (fixed regex)
+                if ($line -match '([a-z0-9\.\-]+\.loclx\.io:\d{2,6})') { $public = $matches[1]; $found = $true; break }
+                if ($line -match 'tcp://([^\s:]+:\d{2,6})') { $public = $matches[1]; $found = $true; break }
+                if ($line -match 'Forwarding.*?([a-z0-9\.\-]+\.loclx\.io:\d{2,6})') { $public = $matches[1]; $found = $true; break }
+              }
+              while ($readerErr.Peek() -ge 0) {
+                $eline = $readerErr.ReadLine()
+                if ($eline -ne $null) { Add-Content -Path $errLog -Value $eline }
+                if (-not $found) {
+                  if ($eline -match '([a-z0-9\.\-]+\.loclx\.io:\d{2,6})') { $public = $matches[1]; $found = $true; break }
+                  if ($eline -match 'tcp://([^\s:]+:\d{2,6})') { $public = $matches[1]; $found = $true; break }
+                }
+              }
+            } catch { Start-Sleep -Milliseconds 200 }
           }
 
           if (-not $public) {
@@ -145,6 +137,7 @@ jobs:
             if (Test-Path $outLog) { Get-Content $outLog -Tail 200 } else { Write-Host "(no out log)" }
             Write-Host "===== loclx ERR log (tail 200) ====="
             if (Test-Path $errLog) { Get-Content $errLog -Tail 200 } else { Write-Host "(no err log)" }
+            try { if (-not $proc.HasExited) { $proc.Kill() } } catch {}
             Write-Error "Failed to obtain LocalXpose public address after waiting $maxSeconds seconds."
             exit 1
           }
@@ -180,5 +173,4 @@ jobs:
           Write-Host "USERNAME=rdpuser"
           Write-Host "PASSWORD=$env:RDP_PASSWORD"
           Write-Host "=== END ==="
-          # keep job alive while you want the tunnel (cancel run from GitHub to stop)
           while ($true) { Start-Sleep -Seconds 300 }
