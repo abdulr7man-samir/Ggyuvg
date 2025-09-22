@@ -1,175 +1,40 @@
-name: RDP - LocalXpose (loclx) stable
+name: Windows RDP with LocalXpose
 
 on:
   workflow_dispatch:
 
 jobs:
-  rdp-loclx:
-    runs-on: windows-2022
-    timeout-minutes: 360
-
+  build:
+    runs-on: windows-latest
     steps:
-      - name: Validate secret
-        shell: pwsh
+      - name: Download LocalXpose
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/localxpose/cli/releases/latest/download/loclx-windows-amd64.zip" -OutFile "loclx.zip"
+          Expand-Archive loclx.zip -DestinationPath .
+          move loclx.exe C:\Windows\System32\loclx.exe
+
+      - name: Authenticate LocalXpose
+        run: |
+          loclx authtoken $env:LOCLX_TOKEN
         env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          LOCLX_TOKEN: ${{ secrets.LOCLX_TOKEN }}
+
+      - name: Setup RDP user
         run: |
-          if (-not $env:RDP_PASSWORD) { Write-Error "Add secret RDP_PASSWORD in repo Settings → Secrets"; exit 1 }
-          Write-Host "RDP_PASSWORD present."
+          net user runneradmin MyStrongPass123! /add
+          net localgroup administrators runneradmin /add
+          reg add "HKLM\System\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f
 
-      - name: Enable Remote Desktop & firewall
-        shell: pwsh
+      - name: Start LocalXpose Tunnel
         run: |
-          Write-Host "Enabling RDP..."
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
-          netsh advfirewall firewall add rule name="Allow RDP (loclx)" dir=in action=allow protocol=TCP localport=3389
-          Restart-Service -Name TermService -ErrorAction SilentlyContinue
+          Start-Process -FilePath "loclx.exe" -ArgumentList "tunnel tcp --to 3389" -NoNewWindow
+          Start-Sleep -s 20
+          loclx status > tunnel.log
+          Get-Content tunnel.log
 
-      - name: Create local RDP user (rdpuser)
-        shell: pwsh
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+      - name: Print Credentials
         run: |
-          $username = "rdpuser"
-          $pwd = $env:RDP_PASSWORD
-          $secure = ConvertTo-SecureString $pwd -AsPlainText -Force
-          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
-            New-LocalUser -Name $username -Password $secure -AccountNeverExpires -PasswordNeverExpires
-            Write-Host "User created: $username"
-          } else {
-            $u = Get-LocalUser -Name $username
-            $u | Set-LocalUser -Password $secure
-            Write-Host "User exists — password updated"
-          }
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
-
-      - name: Download loclx binary (fallback safe)
-        shell: pwsh
-        run: |
-          $outDir = "C:\loclx"
-          New-Item -Path $outDir -ItemType Directory -Force | Out-Null
-          $exe = Join-Path $outDir "loclx.exe"
-          $urls = @(
-            "https://github.com/LocalXpose/localxpose/releases/latest/download/loclx-windows-amd64.exe",
-            "https://github.com/LocalXpose/localxpose/releases/download/v0.0.0/loclx-windows-amd64.exe"
-          )
-          $downloaded = $false
-          foreach ($u in $urls) {
-            try {
-              Write-Host "Trying $u"
-              Invoke-WebRequest -Uri $u -OutFile $exe -UseBasicParsing -ErrorAction Stop
-              icacls $exe /grant "Users:(RX)" | Out-Null
-              Write-Host "Saved loclx to $exe"
-              $downloaded = $true
-              break
-            } catch {
-              Write-Host "Download failed (url may be outdated): $($_.Exception.Message)"
-            }
-          }
-          if (-not $downloaded) {
-            Write-Host "Warning: could not download loclx binary. Will attempt npm install in later step."
-          }
-
-      - name: Ensure npm/loclx (try npm install)
-        shell: pwsh
-        run: |
-          if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
-            Write-Host "npm not found on runner. Trying winget to install NodeJS..."
-            try { winget install -e --id OpenJS.NodeJS.LTS -h } catch { Write-Host "winget install failed or not available." }
-          }
-          if (Get-Command npm -ErrorAction SilentlyContinue) {
-            Write-Host "Attempting npm install of loclx..."
-            try {
-              npm install -g loclx
-            } catch {
-              Write-Host "npm install loclx failed (may require different package name)."
-            }
-          } else {
-            Write-Host "npm still not available; relying on downloaded binary if present."
-          }
-          # print which loclx will be used
-          if (Get-Command loclx -ErrorAction SilentlyContinue) { Write-Host "loclx CLI found: $(loclx --version 2>$null)" } elseif (Test-Path "C:\loclx\loclx.exe") { Write-Host "loclx binary present at C:\loclx\loclx.exe" } else { Write-Host "No loclx CLI available." }
-
-      - name: Start LocalXpose TCP tunnel and capture public host:port
-        shell: pwsh
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-        run: |
-          $logDir = "C:\loclx"
-          if (-not (Test-Path $logDir)) { New-Item -Path $logDir -ItemType Directory | Out-Null }
-          $log = Join-Path $logDir "loclx.log"
-          if (Test-Path $log) { Remove-Item $log -Force }
-
-          Write-Host "Starting loclx tunnel (TCP -> localhost:3389) in background..."
-          $job = Start-Job -ScriptBlock {
-            # prefer installed loclx CLI, else binary at C:\loclx\loclx.exe
-            if (Get-Command loclx -ErrorAction SilentlyContinue) {
-              loclx tunnel tcp --to localhost:3389 *>&1 | Out-File -FilePath "C:\loclx\loclx.log" -Encoding UTF8
-            } elseif (Test-Path "C:\loclx\loclx.exe") {
-              & "C:\loclx\loclx.exe" tunnel tcp --to localhost:3389 *>&1 | Out-File -FilePath "C:\loclx\loclx.log" -Encoding UTF8
-            } else {
-              Write-Output "NO_LOCLX_BIN"
-            }
-          }
-
-          $public = $null
-          $maxSeconds = 240
-          $elapsed = 0
-          while (-not $public -and $elapsed -lt $maxSeconds) {
-            Start-Sleep -Seconds 3
-            $elapsed += 3
-            if (Test-Path $log) {
-              $txt = Get-Content $log -Raw -ErrorAction SilentlyContinue
-              # patterns: host:port on loclx domains or tcp://host:port
-              if ($txt -match "([a-z0-9\-\_]+\.loclx\.io[:]\d{2,6})") { $public = $matches[1]; break }
-              if ($txt -match "tcp://([^\s]+:\d{2,6})") { $public = $matches[1]; break }
-              if ($txt -match "Forwarding.*?([a-z0-9\-\_]+\.loclx\.io[:]\d{2,6})") { $public = $matches[1]; break }
-              if ($txt -match "Forwarding.*?tcp://([^\s]+:\d{2,6})") { $public = $matches[1]; break }
-            }
-          }
-
-          if (-not $public) {
-            Write-Host "===== loclx log (tail 200) ====="
-            if (Test-Path $log) { Get-Content $log -Tail 200 } else { Write-Host "(no loclx log)"; }
-            try { Stop-Job -Job $job -ErrorAction SilentlyContinue } catch {}
-            try { Remove-Job -Job $job -ErrorAction SilentlyContinue } catch {}
-            Write-Error "Failed to obtain loclx public address after waiting $maxSeconds seconds."
-            exit 1
-          }
-
-          Write-Host "LOCX_PUBLIC=$public"
-          echo "LOCX_PUBLIC=$public" >> $env:GITHUB_ENV
-
-          # write credentials file for artifact
-          $credFile = "C:\rdp_credentials.txt"
-          "Host: $public" | Out-File $credFile -Encoding UTF8
-          "Username: rdpuser" | Out-File $credFile -Append -Encoding UTF8
-          "Password: $env:RDP_PASSWORD" | Out-File $credFile -Append -Encoding UTF8
-          Write-Host "Saved credentials to $credFile"
-
-      - name: Upload loclx log artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: loclx-log
-          path: C:\loclx\loclx.log
-
-      - name: Upload credentials artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: rdp-credentials
-          path: C:\rdp_credentials.txt
-
-      - name: Final output (print final lines)
-        shell: pwsh
-        env:
-          LOCX_PUBLIC: ${{ env.LOCX_PUBLIC }}
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-        run: |
-          Write-Host ""
-          Write-Host "=== COPY THESE LINES (FINAL) ==="
-          Write-Host "PUBLIC_RDP=$env:LOCX_PUBLIC"
-          Write-Host "USERNAME=rdpuser"
-          Write-Host "PASSWORD=$env:RDP_PASSWORD"
-          Write-Host "=== END ==="
-          # keep job alive while you want the tunnel (cancel run from GitHub to stop)
-          while ($true) { Start-Sleep -Seconds 300 }
+          echo "===== RDP DETAILS ====="
+          echo "Host: (Check the above loclx status output)"
+          echo "Username: runneradmin"
+          echo "Password: MyStrongPass123!"
