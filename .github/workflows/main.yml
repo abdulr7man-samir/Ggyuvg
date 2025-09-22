@@ -1,44 +1,27 @@
-name: Windows RDP with LocalXpose
+- name: 🔑 Login to LocalXpose
+  run: |
+    loclx account login --access-token $env:LOC_TOKEN
+  env:
+    LOC_TOKEN: ${{ secrets.LOC_TOKEN }}
 
-on:
-  workflow_dispatch:
+- name: 🚀 Start LocalXpose Tunnel (RDP)
+  run: |
+    # شغل التونيل كـ foreground
+    Start-Process -FilePath "loclx" -ArgumentList "tunnel tcp --to 3389" `
+      -NoNewWindow -RedirectStandardOutput "C:\loclx_out.log" -RedirectStandardError "C:\loclx_err.log"
 
-jobs:
-  build:
-    runs-on: windows-latest
-    steps:
-      - name: 🖥️ Install Chocolatey
-        run: |
-          Set-ExecutionPolicy Bypass -Scope Process -Force
-          [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
-          Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))
+    # استنى شوية لحد ما التونيل يفتح
+    Start-Sleep -Seconds 20
 
-      - name: 🌐 Install LocalXpose
-        run: choco install localxpose -y
+    # اقرا اللوج واطلع اللينك
+    $publicUrl = Get-Content C:\loclx_out.log | Select-String -Pattern "tcp://"
+    if (-not $publicUrl) {
+      Write-Error "❌ Failed to obtain LocalXpose public address."
+      exit 1
+    }
 
-      - name: 🔑 Login to LocalXpose
-        run: |
-          loclx account login --token $env:LOC_TOKEN
-        env:
-          LOC_TOKEN: ${{ secrets.LOC_TOKEN }}
-
-      - name: 🚀 Start LocalXpose Tunnel (RDP)
-        run: |
-          # شغل التونيل كـ foreground
-          Start-Process -FilePath "loclx" -ArgumentList "tunnel tcp --to 3389" -NoNewWindow -RedirectStandardOutput loclx.log -RedirectStandardError loclx.log
-          
-          # استنى شوية لحد ما التونيل يفتح
-          Start-Sleep -Seconds 20
-          
-          # اقرا اللوج واطلع اللينك
-          $publicUrl = Get-Content loclx.log | Select-String -Pattern "tcp://"
-          if (-not $publicUrl) {
-            Write-Error "❌ Failed to obtain LocalXpose public address."
-            exit 1
-          }
-
-          Write-Output "✅ RDP available at: $publicUrl"
-          Write-Output "🧑 Username: runneradmin"
-          Write-Output "🔑 Password: $env:USER_PASS"
-        env:
-          USER_PASS: ${{ secrets.USER_PASS }}
+    Write-Output "✅ RDP available at: $publicUrl"
+    Write-Output "🧑 Username: runneradmin"
+    Write-Output "🔑 Password: $env:USER_PASS"
+  env:
+    USER_PASS: ${{ secrets.USER_PASS }}
