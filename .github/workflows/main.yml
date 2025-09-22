@@ -1,4 +1,4 @@
-name: 💻 RDP with LocalXpose
+name: RDP with LocalXpose (stable, ACCESS_TOKEN)
 
 on:
   workflow_dispatch:
@@ -6,40 +6,179 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 360
 
     steps:
-    - name: 🛠️ Install LocalXpose
-      run: choco install localxpose -y
+      - name: Validate secrets
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          LOC_TOKEN: ${{ secrets.LOC_TOKEN }}
+        run: |
+          if (-not $env:RDP_PASSWORD) { Write-Error "Add secret RDP_PASSWORD"; exit 1 }
+          if (-not $env:LOC_TOKEN)     { Write-Error "Add secret LOC_TOKEN (LocalXpose access token)"; exit 1 }
+          Write-Host "Secrets present."
 
-    - name: 🔑 Login to LocalXpose
-      run: |
-        loclx account login --access-token $env:LOC_TOKEN
-      env:
-        LOC_TOKEN: ${{ secrets.LOC_TOKEN }}
+      - name: Enable RDP & create user
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          Write-Host "Enabling RDP and firewall..."
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
+          netsh advfirewall firewall add rule name="Allow RDP (loclx)" dir=in action=allow protocol=TCP localport=3389
+          # create user (if not exists) and set password
+          $username = "rdpuser"
+          $pwd = $env:RDP_PASSWORD
+          $secure = ConvertTo-SecureString $pwd -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $username -Password $secure -AccountNeverExpires -PasswordNeverExpires
+            Write-Host "User created: $username"
+          } else {
+            Get-LocalUser -Name $username | Set-LocalUser -Password $secure
+            Write-Host "User exists — password updated"
+          }
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
 
-    - name: 🚀 Start LocalXpose Tunnel (RDP)
-      run: |
-        Start-Process -FilePath "loclx" -ArgumentList "tunnel tcp --to 3389" `
-          -NoNewWindow -RedirectStandardOutput "C:\loclx_out.log" -RedirectStandardError "C:\loclx_err.log"
+      - name: Install Chocolatey (if missing) and LocalXpose
+        shell: pwsh
+        run: |
+          # install choco if missing (safe: will skip if exists)
+          if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+            Write-Host "Installing Chocolatey..."
+            Set-ExecutionPolicy Bypass -Scope Process -Force
+            [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+            Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))
+          } else {
+            Write-Host "Chocolatey present."
+          }
+          # install localxpose via choco (idempotent)
+          choco install localxpose -y --no-progress
 
-        Start-Sleep -Seconds 20
+      - name: Prepare logs & set ACCESS_TOKEN env for loclx
+        shell: pwsh
+        env:
+          LOC_TOKEN: ${{ secrets.LOC_TOKEN }}
+        run: |
+          New-Item -ItemType Directory -Path C:\loclx -Force | Out-Null
+          Remove-Item -Path C:\loclx\loclx_out.log -ErrorAction SilentlyContinue
+          Remove-Item -Path C:\loclx\loclx_err.log -ErrorAction SilentlyContinue
+          # set ACCESS_TOKEN for loclx (the CLI reads ACCESS_TOKEN env var)
+          $env:ACCESS_TOKEN = $env:LOC_TOKEN
+          Write-Host "ACCESS_TOKEN environment variable set for this step."
 
-        $publicUrl = Get-Content C:\loclx_out.log | Select-String -Pattern "tcp://"
-        if (-not $publicUrl) {
-          Write-Error "❌ Failed to obtain LocalXpose public address."
-          Get-Content C:\loclx_err.log
-          exit 1
-        }
+      - name: Start LocalXpose tunnel (foreground with logs) and extract host:port
+        shell: pwsh
+        env:
+          ACCESS_TOKEN: ${{ secrets.LOC_TOKEN }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $loclxPath = (Get-Command loclx -ErrorAction SilentlyContinue).Source
+          if (-not $loclxPath) {
+            # try exe path from choco default location
+            $possible = "C:\ProgramData\chocolatey\bin\loclx.exe"
+            if (Test-Path $possible) { $loclxPath = $possible }
+          }
+          if (-not $loclxPath) {
+            Write-Error "loclx binary not found on PATH and not at expected choco path."
+            exit 1
+          }
+          Write-Host "Using loclx at: $loclxPath"
 
-        Write-Output "✅ RDP available at: $($publicUrl.Matches.Value)"
-        Write-Output "🧑 Username: runneradmin"
-        Write-Output "🔑 Password: $env:USER_PASS"
-      env:
-        USER_PASS: ${{ secrets.USER_PASS }}
+          $outLog = "C:\loclx\loclx_out.log"
+          $errLog = "C:\loclx\loclx_err.log"
+          # start loclx tunnel as a process and redirect output to separate files
+          $si = New-Object System.Diagnostics.ProcessStartInfo
+          $si.FileName = $loclxPath
+          $si.Arguments = "tunnel tcp --to localhost:3389"
+          $si.RedirectStandardOutput = $true
+          $si.RedirectStandardError = $true
+          $si.UseShellExecute = $false
+          $si.CreateNoWindow = $true
+          # IMPORTANT: ensure ACCESS_TOKEN environment variable is passed to process
+          $si.EnvironmentVariables["ACCESS_TOKEN"] = $env:ACCESS_TOKEN
 
-    - name: 💤 Keep session alive
-      run: |
-        Write-Output "⏳ Keeping RDP session alive..."
-        while ($true) {
-          Start-Sleep -Seconds 300
-        }
+          $proc = New-Object System.Diagnostics.Process
+          $proc.StartInfo = $si
+          $stdout = New-Object System.IO.StreamWriter($outLog, $false, [System.Text.Encoding]::UTF8)
+          $stderr = New-Object System.IO.StreamWriter($errLog, $false, [System.Text.Encoding]::UTF8)
+          $proc.Start() | Out-Null
+
+          # async read stdout/stderr and write to files
+          $stdOutReader = $proc.StandardOutput
+          $stdErrReader = $proc.StandardError
+          Start-Job -Name loclxStreamJob -ScriptBlock {
+            param($outPath,$errPath)
+            while ($true) {
+              try {
+                if ($stdOutReader.Peek() -ge 0) {
+                  $line = $stdOutReader.ReadLine()
+                  if ($line -ne $null) { Add-Content -Path $outPath -Value $line }
+                }
+                if ($stdErrReader.Peek() -ge 0) {
+                  $eline = $stdErrReader.ReadLine()
+                  if ($eline -ne $null) { Add-Content -Path $errPath -Value $eline }
+                }
+                Start-Sleep -Milliseconds 200
+                if ($proc.HasExited) { break }
+              } catch { Start-Sleep -Milliseconds 200 }
+            }
+          } -ArgumentList $outLog,$errLog | Out-Null
+
+          # wait until the tunnel prints a tcp host:port (or timeout)
+          $public = $null
+          $maxSeconds = 180
+          $elapsed = 0
+          while (-not $public -and $elapsed -lt $maxSeconds) {
+            Start-Sleep -Seconds 3
+            $elapsed += 3
+            if (Test-Path $outLog) {
+              $txt = Get-Content $outLog -Raw -ErrorAction SilentlyContinue
+              if ($txt -match "([a-z0-9\-\_]+\.loclx\.io[:]\d{2,6})") { $public = $matches[1]; break }
+              if ($txt -match "tcp://([^\s]+:\d{2,6})") { $public = $matches[1]; break }
+              if ($txt -match "Forwarding.*?([a-z0-9\-\_]+\.loclx\.io[:]\d{2,6})") { $public = $matches[1]; break }
+            }
+          }
+
+          if (-not $public) {
+            Write-Host "===== loclx OUT log (tail 200) ====="
+            if (Test-Path $outLog) { Get-Content $outLog -Tail 200 } else { Write-Host "(no out log)" }
+            Write-Host "===== loclx ERR log (tail 200) ====="
+            if (Test-Path $errLog) { Get-Content $errLog -Tail 200 } else { Write-Host "(no err log)" }
+            Write-Error "Failed to obtain LocalXpose public address after waiting $maxSeconds seconds."
+            exit 1
+          }
+
+          Write-Host "LOCX_PUBLIC=$public"
+          echo "LOCX_PUBLIC=$public" >> $env:GITHUB_ENV
+
+          # save credentials
+          $credFile = "C:\rdp_credentials.txt"
+          "Host: $public" | Out-File $credFile -Encoding UTF8
+          "Username: rdpuser" | Out-File $credFile -Append -Encoding UTF8
+          "Password: $env:RDP_PASSWORD" | Out-File $credFile -Append -Encoding UTF8
+          Write-Host "Saved credentials to $credFile"
+
+      - name: Upload artifacts (logs + credentials)
+        uses: actions/upload-artifact@v4
+        with:
+          name: loclx-artifacts
+          path: |
+            C:\loclx\loclx_out.log
+            C:\loclx\loclx_err.log
+            C:\rdp_credentials.txt
+
+      - name: Final output (print final lines)
+        shell: pwsh
+        env:
+          LOCX_PUBLIC: ${{ env.LOCX_PUBLIC }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          Write-Host ""
+          Write-Host "=== COPY THESE LINES (FINAL) ==="
+          Write-Host "PUBLIC_RDP=$env:LOCX_PUBLIC"
+          Write-Host "USERNAME=rdpuser"
+          Write-Host "PASSWORD=$env:RDP_PASSWORD"
+          Write-Host "=== END ==="
+          # keep job alive while you want the tunnel (cancel run from GitHub to stop)
+          while ($true) { Start-Sleep -Seconds 300 }
