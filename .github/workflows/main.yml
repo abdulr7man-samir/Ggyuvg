@@ -1,37 +1,144 @@
-name: RDP with PageKite
+name: RDP via PageKite
 
 on:
   workflow_dispatch:
 
 jobs:
-  build:
+  rdp-pagekite:
     runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
-    - name: Set password
-      run: |
-        echo "USER_PASS=$env:USER_PASS" >> $env:GITHUB_ENV
-      env:
-        USER_PASS: ${{ secrets.USER_PASS }}
+      - name: Validate secrets
+        shell: pwsh
+        env:
+          PAGEKITE_SECRET: ${{ secrets.PAGEKITE_SECRET }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if (-not $env:PAGEKITE_SECRET) { Write-Error "Add secret PAGEKITE_SECRET in repo Settings→Secrets"; exit 1 }
+          if (-not $env:RDP_PASSWORD)   { Write-Error "Add secret RDP_PASSWORD in repo Settings→Secrets"; exit 1 }
+          Write-Host "Secrets present."
 
-    - name: Enable RDP
-      run: |
-        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
-        Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+      - name: Enable RDP & create user
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          Write-Host "Enable RDP and allow firewall..."
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
+          netsh advfirewall firewall add rule name="Allow RDP (pagekite)" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -ErrorAction SilentlyContinue
 
-    - name: Download PageKite
-      run: |
-        Invoke-WebRequest -Uri "https://pagekite.net/pk/pagekite.py" -OutFile "C:\pagekite.py"
+          $username = "rdpuser"
+          $pwd = $env:RDP_PASSWORD
+          $secure = ConvertTo-SecureString $pwd -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $username -Password $secure -AccountNeverExpires -PasswordNeverExpires
+            Write-Host "User created: $username"
+          } else {
+            Get-LocalUser -Name $username | Set-LocalUser -Password $secure
+            Write-Host "User exists — password updated"
+          }
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
 
-    - name: Start PageKite tunnel
-      run: |
-        python C:\pagekite.py 3389 yoursubdomain.pagekite.me:3389
-      shell: powershell
+      - name: Download pagekite.py
+        shell: pwsh
+        run: |
+          $out = "C:\pagekite"
+          New-Item -Path $out -ItemType Directory -Force | Out-Null
+          $dest = Join-Path $out "pagekite.py"
+          Write-Host "Downloading pagekite.py ..."
+          Invoke-WebRequest -Uri "https://pagekite.net/pk/pagekite.py" -OutFile $dest -UseBasicParsing
+          Write-Host "Saved to $dest"
 
-    - name: Show RDP Credentials
-      run: |
-        Write-Output "✅ Use these credentials to connect:"
-        Write-Output "🌍 Host: yoursubdomain.pagekite.me:3389"
-        Write-Output "🧑 User: runneradmin"
-        Write-Output "🔑 Password: $env:USER_PASS"
+      - name: Start PageKite tunnel (RDP) and capture output
+        shell: pwsh
+        env:
+          PAGEKITE_SECRET: ${{ secrets.PAGEKITE_SECRET }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $outDir = "C:\pagekite"
+          $script = Join-Path $outDir "pagekite.py"
+
+          if (-not (Test-Path $script)) {
+            Write-Error "pagekite.py not found at $script"
+            exit 1
+          }
+
+          # Subdomain you created on PageKite account:
+          $subdomain = "rdpuser.pagekite.me"
+          $secret = $env:PAGEKITE_SECRET
+
+          # Command line: pass subdomain and secret in the form "subdomain:SECRET"
+          # (If this version of pagekite requires @pagekite.net or slight format change adjust as needed.)
+          $args = "3389 $($subdomain):$($secret)"
+
+          Write-Host "Running: python $script $args"
+          # run python with pagekite; redirect output to log files
+          $outLog = Join-Path $outDir "out.log"
+          $errLog = Join-Path $outDir "err.log"
+          if (Test-Path $outLog) { Remove-Item $outLog -Force }
+          if (Test-Path $errLog) { Remove-Item $errLog -Force }
+
+          # Start process (foreground) and capture output lines
+          $proc = Start-Process -FilePath "python" -ArgumentList "$script $args" -NoNewWindow -RedirectStandardOutput $outLog -RedirectStandardError $errLog -PassThru
+
+          # wait and scan logs for confirmation (max 180s)
+          $publicFound = $false
+          $max = 180
+          $t = 0
+          while (-not $publicFound -and $t -lt $max) {
+            Start-Sleep -Seconds 2
+            $t += 2
+            if (Test-Path $outLog) {
+              $txt = Get-Content $outLog -Raw -ErrorAction SilentlyContinue
+              # pagekite usually prints the hostname you registered (we already know subdomain)
+              if ($txt -match $subdomain) { $publicFound = $true; break }
+              # sometimes prints "your kite is running" messages - we try generic tcp match
+              if ($txt -match "listening on|Forwarding|connected|Now serving") { $publicFound = $true; break }
+            }
+            if (Test-Path $errLog) {
+              $et = Get-Content $errLog -Raw -ErrorAction SilentlyContinue
+              if ($et -match "error|failed|denied") { Write-Host "pagekite error:"; Write-Host $et; break }
+            }
+          }
+
+          if (-not $publicFound) {
+            Write-Host "===== pagekite OUT (tail 200) ====="
+            if (Test-Path $outLog) { Get-Content $outLog -Tail 200 } else { Write-Host "(no out log)" }
+            Write-Host "===== pagekite ERR (tail 200) ====="
+            if (Test-Path $errLog) { Get-Content $errLog -Tail 200 } else { Write-Host "(no err log)" }
+            try { if (-not $proc.HasExited) { $proc.Kill() } } catch {}
+            Write-Error "Failed to start PageKite tunnel or confirm it within $max seconds."
+            exit 1
+          }
+
+          Write-Host "PAGEKITE_HOST=$subdomain"
+          echo "PAGEKITE_HOST=$subdomain" >> $env:GITHUB_ENV
+
+          $cred = "C:\rdp_credentials.txt"
+          "Host: $subdomain:3389" | Out-File $cred -Encoding UTF8
+          "Username: rdpuser" | Out-File $cred -Append -Encoding UTF8
+          "Password: $env:RDP_PASSWORD" | Out-File $cred -Append -Encoding UTF8
+          Write-Host "Saved credentials to $cred"
+
+      - name: Upload credentials artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-credentials
+          path: C:\rdp_credentials.txt
+
+      - name: Final output (print final lines)
+        shell: pwsh
+        env:
+          PAGEKITE_HOST: ${{ env.PAGEKITE_HOST }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          Write-Host ""
+          Write-Host "=== RDP ACCESS ==="
+          Write-Host "HOST: $env:PAGEKITE_HOST:3389"
+          Write-Host "USERNAME: rdpuser"
+          Write-Host "PASSWORD: $env:RDP_PASSWORD"
+          Write-Host "==================="
+          # keep the job alive so tunnel stays up (cancel run to stop)
+          while ($true) { Start-Sleep -Seconds 300 }
