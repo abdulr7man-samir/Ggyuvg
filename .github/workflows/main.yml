@@ -1,4 +1,4 @@
-name: RDP with LocalXpose (fixed regex)
+name: RDP with PageKite
 
 on:
   workflow_dispatch:
@@ -9,168 +9,29 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Validate secrets
-        shell: pwsh
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-          LOC_TOKEN: ${{ secrets.LOC_TOKEN }}
-        run: |
-          if (-not $env:RDP_PASSWORD) { Write-Error "Add secret RDP_PASSWORD"; exit 1 }
-          if (-not $env:LOC_TOKEN)     { Write-Error "Add secret LOC_TOKEN (LocalXpose token)"; exit 1 }
-          Write-Host "Secrets present."
+    - name: Set password
+      run: |
+        echo "USER_PASS=$env:USER_PASS" >> $env:GITHUB_ENV
+      env:
+        USER_PASS: ${{ secrets.USER_PASS }}
 
-      - name: Enable RDP & create user
-        shell: pwsh
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-        run: |
-          Write-Host "Enabling RDP and firewall..."
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
-          netsh advfirewall firewall add rule name="Allow RDP (loclx)" dir=in action=allow protocol=TCP localport=3389
-          # create user (if not exists) and set password
-          $username = "rdpuser"
-          $pwd = $env:RDP_PASSWORD
-          $secure = ConvertTo-SecureString $pwd -AsPlainText -Force
-          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
-            New-LocalUser -Name $username -Password $secure -AccountNeverExpires -PasswordNeverExpires
-            Write-Host "User created: $username"
-          } else {
-            Get-LocalUser -Name $username | Set-LocalUser -Password $secure
-            Write-Host "User exists — password updated"
-          }
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
+    - name: Enable RDP
+      run: |
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
+        Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
-      - name: Install Chocolatey (if missing) and LocalXpose
-        shell: pwsh
-        run: |
-          if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
-            Write-Host "Installing Chocolatey..."
-            Set-ExecutionPolicy Bypass -Scope Process -Force
-            [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
-            Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))
-          } else {
-            Write-Host "Chocolatey present."
-          }
-          choco install localxpose -y --no-progress
+    - name: Download PageKite
+      run: |
+        Invoke-WebRequest -Uri "https://pagekite.net/pk/pagekite.py" -OutFile "C:\pagekite.py"
 
-      - name: Prepare logs & set ACCESS_TOKEN env for loclx
-        shell: pwsh
-        env:
-          LOC_TOKEN: ${{ secrets.LOC_TOKEN }}
-        run: |
-          New-Item -ItemType Directory -Path C:\loclx -Force | Out-Null
-          Remove-Item -Path C:\loclx\loclx_out.log -ErrorAction SilentlyContinue
-          Remove-Item -Path C:\loclx\loclx_err.log -ErrorAction SilentlyContinue
-          # set ACCESS_TOKEN for steps that spawn loclx
-          Write-Host "ACCESS_TOKEN will be used by the loclx process (passed via process env)."
+    - name: Start PageKite tunnel
+      run: |
+        python C:\pagekite.py 3389 yoursubdomain.pagekite.me:3389
+      shell: powershell
 
-      - name: Start LocalXpose tunnel (foreground with logs) and extract host:port
-        shell: pwsh
-        env:
-          ACCESS_TOKEN: ${{ secrets.LOC_TOKEN }}
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-        run: |
-          # find loclx binary
-          $loclxCmd = (Get-Command loclx -ErrorAction SilentlyContinue).Source
-          if (-not $loclxCmd) {
-            $possible = "C:\ProgramData\chocolatey\bin\loclx.exe"
-            if (Test-Path $possible) { $loclxCmd = $possible }
-          }
-          if (-not $loclxCmd) {
-            Write-Error "loclx not found on PATH and not at expected choco path."
-            exit 1
-          }
-          Write-Host "Using loclx at: $loclxCmd"
-
-          $outLog = "C:\loclx\loclx_out.log"
-          $errLog = "C:\loclx\loclx_err.log"
-          if (Test-Path $outLog) { Remove-Item $outLog -Force }
-          if (Test-Path $errLog) { Remove-Item $errLog -Force }
-
-          # start process with ACCESS_TOKEN in its environment
-          $si = New-Object System.Diagnostics.ProcessStartInfo
-          $si.FileName = $loclxCmd
-          $si.Arguments = "tunnel tcp --to localhost:3389"
-          $si.RedirectStandardOutput = $true
-          $si.RedirectStandardError  = $true
-          $si.UseShellExecute = $false
-          $si.CreateNoWindow = $true
-          $si.EnvironmentVariables["ACCESS_TOKEN"] = $env:ACCESS_TOKEN
-
-          $proc = New-Object System.Diagnostics.Process
-          $proc.StartInfo = $si
-          $proc.Start() | Out-Null
-
-          # stream stdout/stderr into files until process exits or until we found host
-          $found = $false
-          $public = $null
-          $readerOut = $proc.StandardOutput
-          $readerErr = $proc.StandardError
-
-          $maxSeconds = 180
-          $elapsed = 0
-          while (-not $found -and $elapsed -lt $maxSeconds) {
-            Start-Sleep -Seconds 2
-            $elapsed += 2
-            try {
-              while ($readerOut.Peek() -ge 0) {
-                $line = $readerOut.ReadLine()
-                if ($line -ne $null) { Add-Content -Path $outLog -Value $line }
-                # try match patterns (fixed regex)
-                if ($line -match '([a-z0-9\.\-]+\.loclx\.io:\d{2,6})') { $public = $matches[1]; $found = $true; break }
-                if ($line -match 'tcp://([^\s:]+:\d{2,6})') { $public = $matches[1]; $found = $true; break }
-                if ($line -match 'Forwarding.*?([a-z0-9\.\-]+\.loclx\.io:\d{2,6})') { $public = $matches[1]; $found = $true; break }
-              }
-              while ($readerErr.Peek() -ge 0) {
-                $eline = $readerErr.ReadLine()
-                if ($eline -ne $null) { Add-Content -Path $errLog -Value $eline }
-                if (-not $found) {
-                  if ($eline -match '([a-z0-9\.\-]+\.loclx\.io:\d{2,6})') { $public = $matches[1]; $found = $true; break }
-                  if ($eline -match 'tcp://([^\s:]+:\d{2,6})') { $public = $matches[1]; $found = $true; break }
-                }
-              }
-            } catch { Start-Sleep -Milliseconds 200 }
-          }
-
-          if (-not $public) {
-            Write-Host "===== loclx OUT log (tail 200) ====="
-            if (Test-Path $outLog) { Get-Content $outLog -Tail 200 } else { Write-Host "(no out log)" }
-            Write-Host "===== loclx ERR log (tail 200) ====="
-            if (Test-Path $errLog) { Get-Content $errLog -Tail 200 } else { Write-Host "(no err log)" }
-            try { if (-not $proc.HasExited) { $proc.Kill() } } catch {}
-            Write-Error "Failed to obtain LocalXpose public address after waiting $maxSeconds seconds."
-            exit 1
-          }
-
-          Write-Host "LOCX_PUBLIC=$public"
-          echo "LOCX_PUBLIC=$public" >> $env:GITHUB_ENV
-
-          # save credentials
-          $credFile = "C:\rdp_credentials.txt"
-          "Host: $public" | Out-File $credFile -Encoding UTF8
-          "Username: rdpuser" | Out-File $credFile -Append -Encoding UTF8
-          "Password: $env:RDP_PASSWORD" | Out-File $credFile -Append -Encoding UTF8
-          Write-Host "Saved credentials to $credFile"
-
-      - name: Upload artifacts (logs + credentials)
-        uses: actions/upload-artifact@v4
-        with:
-          name: loclx-artifacts
-          path: |
-            C:\loclx\loclx_out.log
-            C:\loclx\loclx_err.log
-            C:\rdp_credentials.txt
-
-      - name: Final output (print final lines)
-        shell: pwsh
-        env:
-          LOCX_PUBLIC: ${{ env.LOCX_PUBLIC }}
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-        run: |
-          Write-Host ""
-          Write-Host "=== COPY THESE LINES (FINAL) ==="
-          Write-Host "PUBLIC_RDP=$env:LOCX_PUBLIC"
-          Write-Host "USERNAME=rdpuser"
-          Write-Host "PASSWORD=$env:RDP_PASSWORD"
-          Write-Host "=== END ==="
-          while ($true) { Start-Sleep -Seconds 300 }
+    - name: Show RDP Credentials
+      run: |
+        Write-Output "✅ Use these credentials to connect:"
+        Write-Output "🌍 Host: yoursubdomain.pagekite.me:3389"
+        Write-Output "🧑 User: runneradmin"
+        Write-Output "🔑 Password: $env:USER_PASS"
